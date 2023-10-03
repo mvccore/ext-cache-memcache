@@ -21,7 +21,8 @@
 	}],
 	"require": {
 		"php": ">=5.4.0",
-		"mvccore/ext-cache": "^5.2"
+		"mvccore/ext-cache": "^5.2",
+		"mvccore/mvccore": "^5.1.19"
 	},
 	"autoload": {
 		"classmap": [
