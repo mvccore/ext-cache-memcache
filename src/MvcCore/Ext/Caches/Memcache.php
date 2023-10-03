@@ -13,17 +13,45 @@
 
 namespace MvcCore\Ext\Caches;
 
-class Memcache implements \MvcCore\Ext\ICache {
+/**
+ * @method static \MvcCore\Ext\Caches\Memcache GetInstance(string|array|NULL $connectionArguments,...)
+ * Create or get cached cache wrapper instance.
+ * If first argument is string, it's used as connection name.
+ * If first argument is array, it's used as connection config array with keys:
+ *  - `name`     default: `default`,
+ *  - `host`     default: `127.0.0.1`, it could be single IP string 
+ *               or an array of IPs and weights for multiple servers:
+ *               `['192.168.0.10' => 1, '192.168.0.11' => 2, ...]`,
+ *  - `port`     default: 11211, it could be single port integer 
+ *               for single or multiple servers or an array 
+ *               of ports for multiple servers: `[11211, 11212, ...]`,
+ *  - `database` default: `$_SERVER['SERVER_NAME']`,
+ *  - `timeout`  default: `1`, in seconds,
+ *  - `provider` default: `FALSE`, boolean to compress data.
+ *  If no argument provided, there is returned `default` 
+ *  connection name with default initial configuration values.
+ * @method \Memcache|NULL GetProvider() Get `\Memcache` provider instance.
+ * @method \MvcCore\Ext\Caches\Memcache SetProvider(\Memcache|NULL $provider) Set `\Memcache` provider instance.
+ * @property Memcache|NULL $provider
+ */
+class		Memcache
+extends		\MvcCore\Ext\Caches\Base
+implements	\MvcCore\Ext\ICache {
 	
 	/**
-	 * MvcCore Extension - Cache - Memcached - version:
+	 * MvcCore Extension - Cache - Memcache (older) - version:
 	 * Comparison by PHP function version_compare();
 	 * @see http://php.net/manual/en/function.version-compare.php
 	 */
 	const VERSION = '5.2.0';
 
-	/** @var array<string,\MvcCore\Ext\Caches\Memcached> */
-	protected static $instances	= [];
+	/**
+	 * Provider configuration keys.
+	 */
+	const 
+		PROVIDER_COMPRESS		= 'compress',
+		PROVIDER_THRESHOLD		= 'threshold',
+		PROVIDER_MIN_SAVINGS	= 'min_savings';
 
 	/** @var array */
 	protected static $defaults	= [
@@ -31,114 +59,54 @@ class Memcache implements \MvcCore\Ext\ICache {
 		\MvcCore\Ext\ICache::CONNECTION_NAME		=> NULL,
 		\MvcCore\Ext\ICache::CONNECTION_HOST		=> '127.0.0.1',
 		\MvcCore\Ext\ICache::CONNECTION_PORT		=> 11211,
-		\MvcCore\Ext\ICache::CONNECTION_TIMEOUT		=> 500, // in milliseconds, 0.5s, only for non-blocking I/O
+		\MvcCore\Ext\ICache::CONNECTION_TIMEOUT		=> 1, // in seconds
 		\MvcCore\Ext\ICache::PROVIDER_CONFIG		=> [
-			//'\Memcached::OPT_SERIALIZER'			=> '\Memcached::HAVE_IGBINARY', // resolved later in code
-			'\Memcached::OPT_LIBKETAMA_COMPATIBLE'	=> TRUE,
-			'\Memcached::OPT_POLL_TIMEOUT'			=> 500, // in milliseconds, 0.5s
-			'\Memcached::OPT_SEND_TIMEOUT'			=> 1000000, // in microseconds, 0.01s
-			'\Memcached::OPT_RECV_TIMEOUT'			=> 1000000, // in microseconds, 0.01s
-			'\Memcached::OPT_COMPRESSION'			=> FALSE,
-			'\Memcached::OPT_SERVER_FAILURE_LIMIT'	=> 5,
-			'\Memcached::OPT_REMOVE_FAILED_SERVERS'	=> TRUE,
-		]
+			/** @see https://www.php.net/manual/en/memcache.setcompressthreshold */
+			self::PROVIDER_COMPRESS					=> FALSE,	// `TRUE` $toolClass compress $cachedFiles records,
+			self::PROVIDER_THRESHOLD				=> 32768,	// Do not compress cache records under this length limit,
+			self::PROVIDER_MIN_SAVINGS				=> 0.2,		// `20%` amount of savings.
+		],
 	];
 
-	/** @var \stdClass|NULL */
-	protected $config			= NULL;
-	
-	/** @var bool|NULL */
-	protected $memcachedExists	= NULL;
-
-	/** @var \Memcached|NULL */
-	protected $memcached		= NULL;
-
-	/** @var bool */
-	protected $enabled			= FALSE;
-
-	/** @var bool|NULL */
-	protected $connected		= NULL;
-
-	/** @var \MvcCore\Application */
-	protected $application		= NULL;
+	/**
+	 * `TRUE` if `igbinary` PHP extension installed.
+	 * @var bool
+	 */
+	protected $igbinary = FALSE;
 
 	/**
-	 * @inheritDoc
-	 * @param string|array|NULL $connectionArguments...
-	 * If string, it's used as connection name.
-	 * If array, it's used as connection config array with keys:
-	 *  - `name`		default: 'default'
-	 *  - `host`		default: '127.0.0.1',
-	 *                  it could be single IP string or an array of IPs and weights for multiple servers:
-	 *                  `['192.168.0.10' => 1, '192.168.0.11' => 2]`
-	 *  - `port`		default: 11211,
-	 *                  it could be single port integer for single or multiple servers 
-	 *                  or an array of ports for multiple servers:
-	 *                  `[11211, 11212]`
-	 *  - `database`	default: $_SERVER['SERVER_NAME']
-	 *  - `timeout`		default: NULL
-	 *  - `provider`	default: []
-	 *  If NULL, there is returned `default` connection
-	 *  name with default initial configuration values.
-	 * @return \MvcCore\Ext\Caches\Memcached
+	 * Database prefix for each memcache key.
+	 * @var string
 	 */
-	public static function GetInstance (/*...$connectionNameOrArguments = NULL*/) {
-		$args = func_get_args();
-		$nameKey = self::CONNECTION_NAME;
-		$config = static::$defaults;
-		$connectionName = $config[$nameKey];
-		if (isset($args[0])) {
-			$arg = & $args[0];
-			if (is_string($arg)) {
-				$connectionName = $arg;
-			} else if (is_array($arg)) {
-				$connectionName = isset($arg[$nameKey])
-					? $arg[$nameKey]
-					: static::$defaults[$nameKey];
-				$config = $arg;
-			} else if ($arg !== NULL) {
-				throw new \InvalidArgumentException(
-					"[".get_class()."] Cache instance getter argument could be ".
-					"only a string connection name or connection config array."
-				);
-			}
-		}
-		if (!isset(self::$instances[$connectionName]))
-			self::$instances[$connectionName] = new static($config);
-		return self::$instances[$connectionName];
-	}
+	protected $prefix = '';
+
+	/**
+	 * `Memcache` write flags to compress data with zlib.
+	 * @var int
+	 */
+	protected $writeFlags = 0;
 
 	/**
 	 * @inheritDoc
 	 * @param array $config Connection config array with keys:
-	 *  - `name`		default: 'default'
-	 *  - `host`		default: '127.0.0.1',
-	 *                  it could be single IP string or an array of IPs and weights for multiple servers:
-	 *                  `['192.168.0.10' => 1, '192.168.0.11' => 2]`
-	 *  - `port`		default: 11211,
-	 *                  it could be single port integer for single or multiple servers 
-	 *                  or an array of ports for multiple servers:
-	 *                  `[11211, 11212]`
-	 *  - `database`	default: $_SERVER['SERVER_NAME']
-	 *  - `timeout`		default: NULL
-	 *  - `provider`	default: []
+	 *  - `name`     default: `default`,
+	 *  - `host`     default: `127.0.0.1`, it could be single IP string 
+	 *               or an array of IPs and weights for multiple servers:
+	 *               `['192.168.0.10' => 1, '192.168.0.11' => 2, ...]`,
+	 *  - `port`     default: 11211, it could be single port integer 
+	 *               for single or multiple servers or an array 
+	 *               of ports for multiple servers: `[11211, 11212, ...]`,
+	 *  - `database` default: `$_SERVER['SERVER_NAME']`,
+	 *  - `timeout`  default: `1`, in seconds,
+	 *  - `provider` default: `FALSE`, boolean to compress data.
 	 */
 	protected function __construct (array $config = []) {
-		$this->memcachedExists = class_exists('\Memcached');
-		$hostKey	= self::CONNECTION_HOST;
-		$portKey	= self::CONNECTION_PORT;
-		$timeoutKey	= self::CONNECTION_TIMEOUT;
+		parent::__construct($config);
+		$this->installed = class_exists('\Memcache');
+		$this->igbinary = function_exists('igbinary_serialize');
 		$dbKey		= self::CONNECTION_DATABASE;
-		if (!isset($config[$hostKey]))
-			$config[$hostKey] = static::$defaults[$hostKey];
-		if (!isset($config[$portKey]))
-			$config[$portKey] = static::$defaults[$portKey];
-		if (!isset($config[$timeoutKey])) 
-			$config[$timeoutKey] = static::$defaults[$timeoutKey];
-		if (!isset($config[$dbKey]))
-			$config[$dbKey]	= static::$defaults[$dbKey];
-		$this->config = (object) $config;
-		$this->application = \MvcCore\Application::GetInstance();
+		if (isset($this->config->{$dbKey}))
+			$this->prefix = $this->config->{$dbKey} . ':';
 	}
 
 	/**
@@ -148,37 +116,14 @@ class Memcache implements \MvcCore\Ext\ICache {
 	public function Connect () {
 		if ($this->connected) {
 			return TRUE;
-		} else if (!$this->memcachedExists) {
+		} else if (!$this->installed) {
 			$this->enabled = FALSE;
 			$this->connected = FALSE;
 		} else {
-			$toolClass = $this->application->GetToolClass();
-			$persKey	= self::CONNECTION_PERSISTENCE;
-			$timeoutKey = self::CONNECTION_TIMEOUT;
-			$provKey	= self::PROVIDER_CONFIG;
-
 			try {
-				if (isset($this->config->{$persKey})) {
-					$this->memcached = new \Memcached($this->config->{$persKey});
-				} else {
-					$this->memcached = new \Memcached();
-				}
-				if (
-					count($this->memcached->getServerList()) > 0 && 
-					$this->memcached->isPersistent()
-				) {
-					$this->connected = TRUE;
-				} else {
-					$this->connectConfigure();
-					$this->connected = $this->connectExecute();
-				}
-				$this->enabled = $this->connected;
-				if ($this->enabled)
-					$this->memcached->setOption(
-						\Memcached::OPT_PREFIX_KEY, 
-						$this->config->{self::CONNECTION_DATABASE}.':'
-					);
-
+				$this->provider = new \Memcache();
+				$this->connectConfigure();
+				$this->enabled = $this->connected = TRUE;
 			} catch (\Exception $e1) { // backward compatibility
 				$this->exceptionHandler($e1);
 				$this->connected = FALSE;
@@ -197,46 +142,23 @@ class Memcache implements \MvcCore\Ext\ICache {
 	 * @return void
 	 */
 	protected function connectConfigure () {
-		// configure provider options:
-		$timeoutKey = self::CONNECTION_TIMEOUT;
-		$provKey = self::PROVIDER_CONFIG;
-		$provConfig = isset($this->config->{$provKey})
-			? $this->config->{$provKey}
-			: [];
-		$provConfigDefault = static::$defaults[$provKey];
-		$mcConstBegin = '\Memcached::';
-		foreach ($provConfigDefault as $constStr => $rawValue) {
-			$const = constant($constStr);
-			if (!isset($provConfig[$const])) {
-				if (is_string($rawValue) && strpos($rawValue, $mcConstBegin) === 0) {
-					if (!defined($rawValue))
-						continue;
-					$value = constant($rawValue);
-				} else {
-					$value = $rawValue;
-				}
-				$provConfig[$const] = $value;
-			}
-		}
-		if (!isset($provConfig[\Memcached::OPT_SERIALIZER]))
-			$provConfig[\Memcached::OPT_SERIALIZER] = $this->memcached->getOption(\Memcached::HAVE_IGBINARY)
-				? \Memcached::SERIALIZER_IGBINARY
-				: \Memcached::SERIALIZER_PHP;
-		$this->memcached->setOption(\Memcached::OPT_CONNECT_TIMEOUT, $this->config->{$timeoutKey});
-		foreach ($provConfig as $provOptKey => $provOptVal)
-			$this->memcached->setOption($provOptKey, $provOptVal);
-		// configure servers:
+		// configure connection pool:
 		$hosts = [];
 		$ports = [];
-		$priorities = [];
+		$weights = [];
 		$cfgHost = $this->config->{self::CONNECTION_HOST};
 		$cfgPort = $this->config->{self::CONNECTION_PORT};
+		$persistent = isset($this->config->{self::CONNECTION_PERSISTENCE});
+		$timeoutKey = self::CONNECTION_TIMEOUT;
+		$timeout = isset($this->config->{$timeoutKey})
+			? $this->config->{$timeoutKey}
+			: static::$defaults[$timeoutKey];
 		if (is_string($cfgHost)) {
 			$hosts = [$cfgHost];
-			$priorities = [1];
+			$weights = [1];
 		} else if (is_array($cfgHost)) {
 			$hosts = array_keys($cfgHost);
-			$priorities = array_values($cfgHost);
+			$weights = array_values($cfgHost);
 		}
 		$serversCount = count($hosts);
 		if (is_int($cfgPort) || is_string($cfgPort)) {
@@ -247,89 +169,21 @@ class Memcache implements \MvcCore\Ext\ICache {
 				$ports = array_fill(0, $serversCount, $ports[0]);
 		}
 		foreach ($hosts as $index => $host)
-			$this->memcached->addServer(
-				$host, $ports[$index], $priorities[$index]
+			$this->provider->addServer(
+				$host, $ports[$index], $persistent, $weights[$index], $timeout
 			);
-	}
-
-	/**
-	 * Process every request connection or first persistent connection.
-	 * @return bool
-	 */
-	protected function connectExecute () {
-		$toolClass	= $this->application->GetToolClass();
-		$version = $toolClass::Invoke(
-			[$this->memcached, 'getVersion'], [],
-			function ($errMsg, $errLevel, $errLine, $errContext) use (& $stats) {
-				$version = NULL;
-			}
-		);
-		return is_string($version);
-	}
-
-	/**
-	 * Handle exception localy.
-	 * @thrown \Exception|\Throwable
-	 * @param  \Exception|\Throwable $e
-	 * @return void
-	 */
-	protected function exceptionHandler ($e) {
-		if ($this->application->GetEnvironment()->IsDevelopment()) {
-			throw $e;
-		} else {
-			$debugClass = $this->application->GetDebugClass();
-			$debugClass::Log($e);
+		// configure compression if necessary:
+		$provKey = self::PROVIDER_CONFIG;
+		$providerConfig = isset($this->config->{$provKey})
+			? $this->config->{$provKey}
+			: [];
+		$config = array_merge([], static::$defaults[$provKey], $providerConfig);
+		if ($config[self::PROVIDER_COMPRESS]) {
+			$this->writeFlags = constant('MEMCACHE_COMPRESSED');
+			$thresold = $config[self::PROVIDER_THRESHOLD];
+			$minSavings = $config[self::PROVIDER_MIN_SAVINGS];
+			$this->provider->setCompressThreshold($thresold, $minSavings);
 		}
-	}
-
-	/**
-	 * @inheritDoc
-	 * @return \Memcached|NULL
-	 */
-	public function GetResource () {
-		return $this->memcached;
-	}
-
-	/**
-	 * @inheritDoc
-	 * @param  \Memcached $resource
-	 * @return \MvcCore\Ext\Caches\Memcached
-	 */
-	public function SetResource ($resource) {
-		$this->memcached = $resource;
-		return $this;
-	}
-
-	/**
-	 * @inheritDoc
-	 * @return \stdClass
-	 */
-	public function GetConfig () {
-		return $this->config;
-	}
-
-	/**
-	 * @inheritDoc
-	 * @param  bool $enable
-	 * @return \MvcCore\Ext\Caches\Memcached
-	 */
-	public function SetEnabled ($enabled) {
-		if ($enabled) {
-			$enabled = ($this->memcachedExists && (
-				$this->connected === NULL ||
-				$this->connected === TRUE
-			));
-		}
-		$this->enabled = $enabled;
-		return $this;
-	}
-
-	/**
-	 * @inheritDoc
-	 * @return bool
-	 */
-	public function GetEnabled () {
-		return $this->enabled;
 	}
 
 	/**
@@ -345,10 +199,12 @@ class Memcache implements \MvcCore\Ext\ICache {
 		if (!$this->enabled)
 			return $result;
 		try {
+			if ($this->igbinary)
+				$content = igbinary_serialize($content);
 			if ($expirationSeconds === NULL) {
-				$this->memcached->set($key, $content);
+				$this->provider->set($this->prefix . $key, $content);
 			} else {
-				$this->memcached->set($key, $content, time() + $expirationSeconds);
+				$this->provider->set($this->prefix . $key, $content, $this->writeFlags, time() + $expirationSeconds);
 			}
 			$this->setCacheTags([$key], $cacheTags);
 			$result = TRUE;
@@ -372,13 +228,19 @@ class Memcache implements \MvcCore\Ext\ICache {
 		if (!$this->enabled || $keysAndContents === NULL)
 			return $result;
 		try {
+			$count = 0;
 			if ($expirationSeconds === NULL) {
-				$this->memcached->setMulti($keysAndContents);
+				foreach ($keysAndContents as $key => $content)
+					if ($this->provider->set($this->prefix . $key, $content))
+						$count++;
 			} else {
-				$this->memcached->setMulti($keysAndContents, time() + $expirationSeconds);
+				$ttl = time() + $expirationSeconds;
+				foreach ($keysAndContents as $key => $content)
+					if ($this->provider->set($this->prefix . $key, $content, $this->writeFlags, $ttl))
+						$count++;
 			}
 			$this->setCacheTags(array_keys($keysAndContents), $cacheTags);
-			$result = TRUE;
+			$result = count($keysAndContents) === $count;
 		} catch (\Exception $e1) { // backward compatibility
 			$this->exceptionHandler($e1);
 		} catch (\Throwable $e2) {
@@ -410,9 +272,12 @@ class Memcache implements \MvcCore\Ext\ICache {
 			return $result;
 		}
 		try {
-			$rawResult = $this->memcached->get($key);
-			if ($this->memcached->getResultCode() === \Memcached::RES_SUCCESS) {
-				$result = $rawResult;
+			$flags = FALSE;
+			$rawResult = $this->provider->get($this->prefix . $key, $flags);
+			if ($flags !== FALSE) {
+				$result = $this->igbinary
+					? igbinary_unserialize($rawResult)
+					: $rawResult;
 			} else if ($notFoundCallback !== NULL) {
 				$result = call_user_func_array($notFoundCallback, [$this, $key]);
 			}
@@ -452,17 +317,14 @@ class Memcache implements \MvcCore\Ext\ICache {
 				return NULL;
 			}
 		}
-		try {
-			$rawContents = $this->memcached->getMulti($keys);
-		} catch (\Exception $e1) { // backward compatibility
-			$this->exceptionHandler($e1);
-		} catch (\Throwable $e2) {
-			$this->exceptionHandler($e2);
-		}
 		foreach ($keys as $index => $key) {
 			try {
-				if (array_key_exists($key, $rawContents)) {
-					$results[$index] = $rawContents[$key];
+				$flags = FALSE;
+				$rawResult = $this->provider->get($this->prefix . $key, $flags);
+				if ($flags !== FALSE) {
+					$results[$index] = $this->igbinary
+						? igbinary_unserialize($rawResult)
+						: $rawResult;
 				} else if ($notFoundCallback !== NULL) {
 					$results[$index] = call_user_func_array($notFoundCallback, [$this, $key]);
 				}
@@ -486,7 +348,7 @@ class Memcache implements \MvcCore\Ext\ICache {
 		if (!$this->enabled) return FALSE;
 		$deleted = FALSE;
 		try {
-			$deleted = $this->memcached->delete($key);
+			$deleted = $this->provider->delete($this->prefix . $key);
 		} catch (\Exception $e1) { // backward compatibility
 			$this->exceptionHandler($e1);
 		} catch (\Throwable $e2) {
@@ -507,10 +369,10 @@ class Memcache implements \MvcCore\Ext\ICache {
 		$deletedKeysCount = 0;
 		try {
 			if (count($keys) > 0) {
-				$deletedKeysCount = call_user_func_array(
-					[$this->memcached, 'deleteMulti'],
-					[$keys]
-				);
+				foreach ($keys as $key) {
+					if ($this->provider->delete($this->prefix . $key))
+						$deletedKeysCount++;
+				}
 			}
 			if (count($keysTags) > 0) {
 				$change = FALSE;
@@ -518,9 +380,12 @@ class Memcache implements \MvcCore\Ext\ICache {
 				$tags2Remove = [];
 				foreach ($keysTags as $cacheKey => $cacheTags) {
 					foreach ($cacheTags as $cacheTag) {
-						$cacheTagFullKey = self::TAG_PREFIX . $cacheTag;
-						$cacheTagKeysSet = $this->memcached->get($cacheTagFullKey);
-						if ($cacheTagKeysSet !== FALSE) {
+						$cacheTagFullKey = $this->prefix . self::TAG_PREFIX . $cacheTag;
+						$flags = FALSE;
+						$cacheTagKeysSet = $this->provider->get($cacheTagFullKey, $flags);
+						if ($flags !== FALSE) {
+							if ($this->igbinary)
+								$cacheTagKeysSet = igbinary_unserialize($cacheTagKeysSet);
 							$tagIndex = array_search($cacheKey, $cacheTagKeysSet, TRUE);
 							if ($tagIndex !== FALSE) {
 								array_splice($cacheTagKeysSet, $tagIndex, 1);
@@ -534,10 +399,14 @@ class Memcache implements \MvcCore\Ext\ICache {
 						}
 					}
 				}
-				if ($change)
-					$this->memcached->setMulti($newTags);
-				if (count($tags2Remove) > 0)
-					$this->memcached->deleteMulti($tags2Remove);
+				if ($change) {
+					foreach ($newTags as $cacheTagFullKey => $cacheTagKeysSet)
+						$this->provider->set($cacheTagFullKey, $cacheTagKeysSet);
+				}
+				if (count($tags2Remove) > 0) {
+					foreach ($tags2Remove as $cacheTagFullKey)
+						$this->provider->delete($cacheTagFullKey);
+				}
 			}
 		} catch (\Exception $e1) { // backward compatibility
 			$this->exceptionHandler($e1);
@@ -564,20 +433,23 @@ class Memcache implements \MvcCore\Ext\ICache {
 		}
 		$keysToDelete = [];
 		foreach ($tagsArr as $tag) {
-			$cacheTag = self::TAG_PREFIX . $tag;
+			$cacheTag = $this->prefix . self::TAG_PREFIX . $tag;
 			$keysToDelete[$cacheTag] = TRUE;
-			$keys2DeleteLocal = $this->memcached->get($cacheTag);
-			if ($keys2DeleteLocal !== FALSE)
+			$flags = FALSE;
+			$keys2DeleteLocal = $this->provider->get($cacheTag);
+			if ($flags !== FALSE) {
+				if ($this->igbinary)
+					$keys2DeleteLocal = igbinary_unserialize($keys2DeleteLocal);
 				foreach ($keys2DeleteLocal as $key2DeleteLocal)
 					$keysToDelete[$key2DeleteLocal] = TRUE;
+			}
 		}
 		$deletedKeysCount = 0;
 		if (count($keysToDelete) > 0) {
 			try {
-				$deletedKeysCount = call_user_func_array(
-					[$this->memcached, 'deleteMulti'],
-					[array_keys($keysToDelete)]
-				);
+				foreach (array_keys($keysToDelete) as $keyToDelete)
+					if ($this->provider->delete($keyToDelete))
+						$deletedKeysCount++;
 			} catch (\Exception $e1) { // backward compatibility
 				$this->exceptionHandler($e1);
 			} catch (\Throwable $e2) {
@@ -596,8 +468,9 @@ class Memcache implements \MvcCore\Ext\ICache {
 		$result = FALSE;
 		if (!$this->enabled) return $result;
 		try {
-			$this->memcached->get($key);
-			$result = $this->memcached->getResultCode() === \Memcached::RES_SUCCESS;
+			$flags = FALSE;
+			$this->provider->get($this->prefix . $key, $flags);
+			$result = $flags !== FALSE;
 		} catch (\Exception $e1) { // backward compatibility
 			$this->exceptionHandler($e1);
 		} catch (\Throwable $e2) {
@@ -623,12 +496,11 @@ class Memcache implements \MvcCore\Ext\ICache {
 			}
 		}
 		try {
-			$allResults = call_user_func_array(
-				[$this->memcached, 'getMulti'],
-				$keysArr
-			);
-			if ($allResults !== FALSE)
-				$result = count($allResults);
+			foreach ($keysArr as $key) {
+				$flags = FALSE;
+				$this->provider->get($this->prefix . $key, $flags);
+				if ($flags !== FALSE) $result++;
+			}
 		} catch (\Exception $e1) { // backward compatibility
 			$this->exceptionHandler($e1);
 		} catch (\Throwable $e2) {
@@ -645,7 +517,7 @@ class Memcache implements \MvcCore\Ext\ICache {
 		$result = FALSE;
 		if (!$this->enabled) return $result;
 		try {
-			$result = $this->memcached->flush();
+			$result = $this->provider->flush();
 		} catch (\Exception $e1) { // backward compatibility
 			$this->exceptionHandler($e1);
 		} catch (\Throwable $e2) {
@@ -658,7 +530,7 @@ class Memcache implements \MvcCore\Ext\ICache {
 	 * Set up cache tag records if necessary:
 	 * @param  \string[] $cacheKeys 
 	 * @param  \string[] $cacheTags 
-	 * @return \MvcCore\Ext\Caches\Memcached
+	 * @return \MvcCore\Ext\Caches\Memcache
 	 */
 	protected function setCacheTags ($cacheKeys = [], $cacheTags = []) {
 		if (count($cacheTags) === 0)
@@ -667,20 +539,30 @@ class Memcache implements \MvcCore\Ext\ICache {
 		$newTags = [];
 		foreach ($cacheKeys as $cacheKey) {
 			foreach ($cacheTags as $cacheTag) {
-				$cacheTagFullKey = self::TAG_PREFIX . $cacheTag;
-				$cacheTagKeysSet = $this->memcached->get($cacheTagFullKey);
-				if ($cacheTagKeysSet === FALSE) {
+				$cacheTagFullKey = $this->prefix . self::TAG_PREFIX . $cacheTag;
+				$flags = FALSE;
+				$cacheTagKeysSet = $this->provider->get($cacheTagFullKey, $flags);
+				if ($flags === FALSE) {
 					$cacheTagKeysSet = [$cacheKey];
 					$change = TRUE;
-				} else if (array_search($cacheKey, $cacheTagKeysSet, TRUE) === FALSE) {
-					$cacheTagKeysSet[] = $cacheKey;
-					$change = TRUE;
+				} else {
+					if ($this->igbinary)
+						$cacheTagKeysSet = igbinary_unserialize($cacheTagKeysSet);
+					if (array_search($cacheKey, $cacheTagKeysSet, TRUE) === FALSE) {
+						$cacheTagKeysSet[] = $cacheKey;
+						$change = TRUE;
+					}
 				}
 				$newTags[$cacheTagFullKey] = $cacheTagKeysSet;
 			}
 		}
-		if ($change)
-			$this->memcached->setMulti($newTags);
+		if ($change) {
+			foreach ($newTags as $cacheTagFullKey => $cacheTagKeysSet) {
+				if ($this->igbinary)
+					$cacheTagKeysSet = igbinary_serialize($cacheTagKeysSet);
+				$this->provider->set($cacheTagFullKey, $cacheTagKeysSet);
+			}
+		}
 		return $this;
 	}
 
