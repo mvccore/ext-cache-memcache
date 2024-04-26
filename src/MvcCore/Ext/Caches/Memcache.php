@@ -43,7 +43,7 @@ implements	\MvcCore\Ext\ICache {
 	 * Comparison by PHP function version_compare();
 	 * @see http://php.net/manual/en/function.version-compare.php
 	 */
-	const VERSION = '5.2.1';
+	const VERSION = '5.2.2';
 
 	/**
 	 * Provider configuration keys.
@@ -59,7 +59,7 @@ implements	\MvcCore\Ext\ICache {
 		\MvcCore\Ext\ICache::CONNECTION_NAME		=> NULL,
 		\MvcCore\Ext\ICache::CONNECTION_HOST		=> '127.0.0.1',
 		\MvcCore\Ext\ICache::CONNECTION_PORT		=> 11211,
-		\MvcCore\Ext\ICache::CONNECTION_TIMEOUT		=> 1, // in seconds
+		\MvcCore\Ext\ICache::CONNECTION_TIMEOUT		=> 0.5, // in seconds
 		\MvcCore\Ext\ICache::PROVIDER_CONFIG		=> [
 			/** @see https://www.php.net/manual/en/memcache.setcompressthreshold */
 			self::PROVIDER_COMPRESS					=> FALSE,	// `TRUE` $toolClass compress $cachedFiles records,
@@ -121,9 +121,14 @@ implements	\MvcCore\Ext\ICache {
 			$this->connected = FALSE;
 		} else {
 			try {
+				set_error_handler(function ($level, $msg, $file = NULL, $line = NULL, $err = NULL) {
+					throw new \Exception($msg, $level);
+				}, E_NOTICE);
 				$this->provider = new \Memcache();
 				$this->connectConfigure();
-				$this->enabled = $this->connected = TRUE;
+				$this->enabled = (
+					$this->connected = $this->provider->getVersion() !== FALSE // real server or server pool connection execution
+				);
 			} catch (\Exception $e1) { // backward compatibility
 				$this->exceptionHandler($e1);
 				$this->connected = FALSE;
@@ -133,6 +138,7 @@ implements	\MvcCore\Ext\ICache {
 				$this->connected = FALSE;
 				$this->enabled = FALSE;
 			}
+			restore_error_handler();
 		}
 		return $this->connected;
 	}
@@ -168,10 +174,12 @@ implements	\MvcCore\Ext\ICache {
 			if (count($ports) !== $serversCount)
 				$ports = array_fill(0, $serversCount, $ports[0]);
 		}
-		foreach ($hosts as $index => $host)
+		foreach ($hosts as $index => $host) {
 			$this->provider->addServer(
 				$host, $ports[$index], $persistent, $weights[$index], $timeout
 			);
+			$this->provider->getServerStatus($host, $ports[$index]);
+		}
 		// configure compression if necessary:
 		$provKey = self::PROVIDER_CONFIG;
 		$providerConfig = isset($this->config->{$provKey})
