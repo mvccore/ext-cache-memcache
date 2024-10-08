@@ -261,10 +261,13 @@ implements	\MvcCore\Ext\ICache {
 	 * @inheritDoc
 	 * @param  string        $key
 	 * @param  callable|NULL $notFoundCallback function ($cache, $cacheKey) { ... $cache->Save($cacheKey, $data); return $data; }
+	 * @throws \Exception    Not found callback is not callable.
 	 * @return mixed|NULL
 	 */
-	public function Load ($key, callable $notFoundCallback = NULL) {
+	public function Load ($key, $notFoundCallback = NULL) {
 		$result = NULL;
+		if ($notFoundCallback !== NULL && !is_callable($notFoundCallback))
+			throw new \Exception("[" . get_class($this) . "] Not found callback is not callable.");
 		if (!$this->enabled) {
 			if ($notFoundCallback !== NULL) {
 				try {
@@ -301,10 +304,13 @@ implements	\MvcCore\Ext\ICache {
 	 * @inheritDoc
 	 * @param  \string[]     $keys
 	 * @param  callable|NULL $notFoundCallback function ($cache, $cacheKey) { ... $cache->Save($cacheKey, $data); return $data; }
+	 * @throws \Exception    Not found callback is not callable.
 	 * @return array|NULL
 	 */
-	public function LoadMultiple (array $keys, callable $notFoundCallback = NULL) {
+	public function LoadMultiple (array $keys, $notFoundCallback = NULL) {
 		$results = [];
+		if ($notFoundCallback !== NULL && !is_callable($notFoundCallback))
+			throw new \Exception("[" . get_class($this) . "] Not found callback is not callable.");
 		if (!$this->enabled) {
 			if ($notFoundCallback !== NULL) {
 				foreach ($keys as $index => $key) {
